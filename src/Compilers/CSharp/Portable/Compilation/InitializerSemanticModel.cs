@@ -281,6 +281,9 @@ namespace Microsoft.CodeAnalysis.CSharp
                     return MemberSymbol.ContainingType is SourceMemberContainerTypeSymbol type &&
                         type.IsNullableEnabledForConstructorsAndInitializers(useStatic: MemberSymbol.IsStatic);
                 case SymbolKind.Parameter:
+                    // Simpler alternative considered and rejected: `(Root as ParameterSyntax) ?? (Root as EqualsValueClauseSyntax)?.Value`.
+                    // It only rescues project-wide `Nullable=enable`; a file-scoped `#nullable enable` pragma stays invisible for Sonar's
+                    // actual (narrow-node) ReplaceNode pattern, since Root's SyntaxTree is then a synthetic tree without the real file's pragma.
                     if (SourceComplexParameterSymbolBase.GetDefaultValueSyntaxForIsNullableAnalysisEnabled(Root as ParameterSyntax) is { } value)
                     {
                         return Compilation.IsNullableAnalysisEnabledIn(value);
