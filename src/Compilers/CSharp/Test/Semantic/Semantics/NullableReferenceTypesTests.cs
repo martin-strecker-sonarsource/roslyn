@@ -65974,7 +65974,7 @@ class C
         }
 
         [Fact]
-        public void SpeculativeSemanticModel_DeconstructionAssignment_LosesNullableFlowState()
+        public void SpeculativeSemanticModel_DeconstructionAssignment_PreservesNullableFlowState()
         {
             // The real compiler proves `generator` is MaybeNull here (see the CS8602 below).
             var source = """
@@ -66013,15 +66013,15 @@ class C
                 .Single(id => id.Identifier.ValueText == "generator");
             var flowState = speculativeModel!.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
 
-            // BUG: whole-method speculative rebind loses flow analysis across the deconstruction
-            // assignment and reports FlowState.None (inconclusive) instead of the real MaybeNull.
-            Assert.Equal(CodeAnalysis.NullableFlowState.None, flowState);
+            // Whole-method speculative rebind now preserves flow analysis across the deconstruction
+            // assignment and reports the real MaybeNull, matching the CS8602 diagnostic above.
+            Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
         }
 
         [Fact]
         public void SpeculativeSemanticModel_PlainInvocation_PreservesNullableFlowState()
         {
-            // Control for SpeculativeSemanticModel_DeconstructionAssignment_LosesNullableFlowState:
+            // Control for SpeculativeSemanticModel_DeconstructionAssignment_PreservesNullableFlowState:
             // same shape, but the receiver feeds a plain statement instead of a deconstruction
             // assignment. Speculation correctly reports MaybeNull here.
             var source = """
@@ -66093,10 +66093,10 @@ class C
                 .Single(id => id.Identifier.ValueText == "generator");
 
             var flowState = model.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
-            // BUG: the real compiler just proved (and reported!) MaybeNull above via CS8602, but the
-            // recorded GetTypeInfo result for the same node is None - this is not a speculation-specific
-            // bug, see DeconstructionBlastRadius_* tests and NullableWalker's _disableNullabilityAnalysis.
-            Assert.Equal(CodeAnalysis.NullableFlowState.None, flowState);
+            // The recorded GetTypeInfo result now matches the MaybeNull the real compiler just
+            // proved (and reported!) above via CS8602 - this was never a speculation-specific bug,
+            // see DeconstructionBlastRadius_* tests and NullableWalker.GetDeconstructionRightParts.
+            Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
         }
 
         [Fact]
@@ -66135,9 +66135,9 @@ class C
             Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
         }
 
-        // Blast-radius mapping for the deconstruction bug above: which shapes lose GetTypeInfo
-        // flow state (both real and speculative - the bug is not speculation-specific) and which
-        // don't. Asserts both the real (non-speculative) and whole-method-speculative FlowState
+        // Blast-radius mapping for the deconstruction bug fixed above: which shapes used to lose
+        // GetTypeInfo flow state (both real and speculative - the bug was not speculation-specific)
+        // and which never did. Asserts both the real (non-speculative) and whole-method-speculative FlowState
         // for the *last* "generator" reference in the method (NarrowedThenDeconstructed has two:
         // the null-check condition, then the deconstructed call - we want the latter).
         private static void AssertDeconstructionBlastRadius(string source, CodeAnalysis.NullableFlowState expectedReal, CodeAnalysis.NullableFlowState expectedSpeculative, string identifierText = "generator")
@@ -66170,7 +66170,7 @@ class C
                 """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
-        public void DeconstructionBlastRadius_DeconstructionDeclaration_Affected() =>
+        public void DeconstructionBlastRadius_DeconstructionDeclaration_NoLongerAffected() =>
             AssertDeconstructionBlastRadius("""
                 #nullable enable
                 class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
@@ -66179,10 +66179,10 @@ class C
                     Generator? generator = null;
                     void M() { var (token, expiryMs) = generator.Generate(); }
                 }
-                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
-        public void DeconstructionBlastRadius_DeconstructionAssignmentToExistingVariables_Affected() =>
+        public void DeconstructionBlastRadius_DeconstructionAssignmentToExistingVariables_NoLongerAffected() =>
             AssertDeconstructionBlastRadius("""
                 #nullable enable
                 class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
@@ -66191,7 +66191,7 @@ class C
                     Generator? generator = null;
                     void M() { string token; long expiryMs; (token, expiryMs) = generator.Generate(); }
                 }
-                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
         public void DeconstructionBlastRadius_OutVar_NotAffected() =>
@@ -66206,7 +66206,7 @@ class C
                 """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
-        public void DeconstructionBlastRadius_ThreeElementTuple_Affected() =>
+        public void DeconstructionBlastRadius_ThreeElementTuple_NoLongerAffected() =>
             AssertDeconstructionBlastRadius("""
                 #nullable enable
                 class Generator { public (string A, string B, string C) Generate() => ("a", "b", "c"); }
@@ -66215,14 +66215,14 @@ class C
                     Generator? generator = null;
                     void M() { var (a, b, c) = generator.Generate(); }
                 }
-                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
-        public void DeconstructionBlastRadius_NarrowedThenDeconstructed_AffectedEvenWhenProvablyNonNull() =>
+        public void DeconstructionBlastRadius_NarrowedThenDeconstructed_NoLongerAffected() =>
             // Matches the "NarrowedThenDeconstructed" accepted-FN case from sonar-dotnet-enterprise PR #2594:
-            // even though the real compiler can prove "generator" is non-null here (narrowed by the
-            // preceding null check), the deconstruction-wide suppression in NullableWalker still
-            // blanks out the recorded result, regardless of how confidently non-null the receiver is.
+            // the real compiler can prove "generator" is non-null here (narrowed by the preceding
+            // null check), and the recorded result now correctly reflects that NotNull state too,
+            // instead of the deconstruction-wide suppression blanking it out to None.
             AssertDeconstructionBlastRadius("""
                 #nullable enable
                 class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
@@ -66236,10 +66236,10 @@ class C
                         }
                     }
                 }
-                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+                """, CodeAnalysis.NullableFlowState.NotNull, CodeAnalysis.NullableFlowState.NotNull);
 
         [Fact]
-        public void DeconstructionBlastRadius_LaterStatementDoesNotMatter_Affected() =>
+        public void DeconstructionBlastRadius_LaterStatementDoesNotMatter_NoLongerAffected() =>
             AssertDeconstructionBlastRadius("""
                 #nullable enable
                 class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
@@ -66252,7 +66252,7 @@ class C
                         System.Console.WriteLine(token);
                     }
                 }
-                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
         public void DeconstructionBlastRadius_RecursivePattern_NotAffected() =>
@@ -66273,9 +66273,11 @@ class C
                 """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull, identifierText: "generator");
 
         [Fact]
-        public void DeconstructionBlastRadius_TupleLiteralRhsWithoutDeconstructMethod_Affected() =>
+        public void DeconstructionBlastRadius_TupleLiteralRhsWithoutDeconstructMethod_NoLongerAffected() =>
             // RHS is a plain tuple literal (ValueTuple), not a call needing a Deconstruct() method -
-            // isolates "deconstruction assignment target" from "Deconstruct() method resolution": still affected.
+            // isolates "deconstruction assignment target" from "Deconstruct() method resolution".
+            // No dereference occurs here (generator is just read into the tuple, not called through),
+            // so MaybeNull (its own declared/tracked flow state) rather than NotNull is correct.
             AssertDeconstructionBlastRadius("""
                 #nullable enable
                 class C
@@ -66286,7 +66288,7 @@ class C
                         var (token, other) = (generator, 1);
                     }
                 }
-                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
@@ -72331,8 +72333,15 @@ class C
             var discard1 = (DeclarationExpressionSyntax)arguments.First().Expression;
             Assert.Equal("var _", discard1.ToString());
             Assert.Equal(CodeAnalysis.NullableAnnotation.None, model.GetTypeInfoAndVerifyIOperation(discard1.Designation).Nullability.Annotation);
-            Assert.Equal("System.String", model.GetTypeInfo(discard1).Type.ToTestDisplayString());
-            Assert.Equal(CodeAnalysis.NullableAnnotation.None, model.GetTypeInfo(discard1).Nullability.Annotation);
+            // The discard's inferred type now correctly reflects x's actual MaybeNull flow state at
+            // this point (from "x = null;" above) instead of the pre-fix recording gap's incomplete
+            // "System.String" - NullableAnnotation.Annotation above is unaffected (still None), only
+            // the annotated Type symbol itself now carries the "?" that was always true but unrecorded.
+            Assert.Equal("System.String?", model.GetTypeInfo(discard1).Type.ToTestDisplayString());
+            // Same fact as the "System.String?" above, reflected through Nullability.Annotation on the
+            // whole declaration expression instead of the Designation checked at line 72335: Annotated,
+            // not None.
+            Assert.Equal(CodeAnalysis.NullableAnnotation.Annotated, model.GetTypeInfo(discard1).Nullability.Annotation);
             Assert.Null(model.GetSymbolInfo(discard1).Symbol);
             Assert.Null(model.GetSymbolInfo(discard1.Designation).Symbol);
             Assert.Null(model.GetDeclaredSymbol(discard1));
@@ -72340,9 +72349,11 @@ class C
 
             var discard2 = arguments.Skip(1).First().Expression;
             Assert.Equal("_", discard2.ToString());
-            Assert.Equal("System.Object", model.GetTypeInfoAndVerifyIOperation(discard2).Type.ToTestDisplayString());
-            Assert.Equal(CodeAnalysis.NullableAnnotation.None, model.GetTypeInfo(discard2).Nullability.Annotation);
-            Assert.Equal("object _", model.GetSymbolInfo(discard2).Symbol.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
+            // Same reasoning as discard1 above: y's actual MaybeNull flow state (from "y = null;")
+            // is now correctly reflected instead of the pre-fix recording gap's incomplete answer.
+            Assert.Equal("System.Object?", model.GetTypeInfoAndVerifyIOperation(discard2).Type.ToTestDisplayString());
+            Assert.Equal(CodeAnalysis.NullableAnnotation.Annotated, model.GetTypeInfo(discard2).Nullability.Annotation);
+            Assert.Equal("object? _", model.GetSymbolInfo(discard2).Symbol.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat));
             Assert.Null(model.GetDeclaredSymbol(discard2));
         }
 
