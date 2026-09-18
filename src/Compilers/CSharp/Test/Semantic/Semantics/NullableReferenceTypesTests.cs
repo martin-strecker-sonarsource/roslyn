@@ -66060,6 +66060,234 @@ class C
             Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
         }
 
+        [Fact]
+        public void NonSpeculative_DeconstructionAssignment_GetTypeInfo_FlowState()
+        {
+            // Control: does the bug even require speculation? Query GetTypeInfo directly on the
+            // ORIGINAL (non-speculative) semantic model for the same receiver.
+            var source = """
+                #nullable enable
+                class Generator
+                {
+                    public (string Token, long ExpiryMs) Generate() => ("token", 0);
+                }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        var (token, expiryMs) = generator.Generate();
+                    }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics(
+                // (11,33): warning CS8602: Dereference of a possibly null reference.
+                //         var (token, expiryMs) = generator.Generate();
+                Diagnostic(ErrorCode.WRN_NullReferenceReceiver, "generator").WithLocation(11, 33));
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var generatorIdentifier = tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "generator");
+
+            var flowState = model.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
+            // BUG: the real compiler just proved (and reported!) MaybeNull above via CS8602, but the
+            // recorded GetTypeInfo result for the same node is None - this is not a speculation-specific
+            // bug, see DeconstructionBlastRadius_* tests and NullableWalker's _disableNullabilityAnalysis.
+            Assert.Equal(CodeAnalysis.NullableFlowState.None, flowState);
+        }
+
+        [Fact]
+        public void NonSpeculative_PlainInvocation_GetTypeInfo_FlowState()
+        {
+            // Control for NonSpeculative_DeconstructionAssignment_GetTypeInfo_FlowState: same
+            // receiver, no deconstruction. Confirms plain GetTypeInfo works outside deconstruction.
+            var source = """
+                #nullable enable
+                class Generator
+                {
+                    public (string Token, long ExpiryMs) Generate() => ("token", 0);
+                }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        generator.Generate();
+                    }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics(
+                // (11,9): warning CS8602: Dereference of a possibly null reference.
+                //         generator.Generate();
+                Diagnostic(ErrorCode.WRN_NullReferenceReceiver, "generator").WithLocation(11, 9));
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var generatorIdentifier = tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "generator");
+
+            var flowState = model.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
+        }
+
+        // Blast-radius mapping for the deconstruction bug above: which shapes lose GetTypeInfo
+        // flow state (both real and speculative - the bug is not speculation-specific) and which
+        // don't. Asserts both the real (non-speculative) and whole-method-speculative FlowState
+        // for the *last* "generator" reference in the method (NarrowedThenDeconstructed has two:
+        // the null-check condition, then the deconstructed call - we want the latter).
+        private static void AssertDeconstructionBlastRadius(string source, CodeAnalysis.NullableFlowState expectedReal, CodeAnalysis.NullableFlowState expectedSpeculative, string identifierText = "generator")
+        {
+            var comp = CreateCompilation(source);
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var methodDecl = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.ValueText == "M");
+
+            var realIdentifier = methodDecl.DescendantNodes().OfType<IdentifierNameSyntax>().Last(id => id.Identifier.ValueText == identifierText);
+            Assert.Equal(expectedReal, model.GetTypeInfo(realIdentifier).Nullability.FlowState);
+
+            var speculatedMethod = (MethodDeclarationSyntax)SyntaxFactory.ParseMemberDeclaration(methodDecl.ToFullString());
+            Assert.True(model.TryGetSpeculativeSemanticModelForMethodBody(methodDecl.Body!.SpanStart, speculatedMethod, out var speculativeModel));
+
+            var specIdentifier = speculatedMethod.DescendantNodes().OfType<IdentifierNameSyntax>().Last(id => id.Identifier.ValueText == identifierText);
+            Assert.Equal(expectedSpeculative, speculativeModel!.GetTypeInfo(specIdentifier).Nullability.FlowState);
+        }
+
+        [Fact]
+        public void DeconstructionBlastRadius_PlainInvocation_NotAffected() =>
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
+                class C
+                {
+                    Generator? generator = null;
+                    void M() { generator.Generate(); }
+                }
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
+
+        [Fact]
+        public void DeconstructionBlastRadius_DeconstructionDeclaration_Affected() =>
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
+                class C
+                {
+                    Generator? generator = null;
+                    void M() { var (token, expiryMs) = generator.Generate(); }
+                }
+                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void DeconstructionBlastRadius_DeconstructionAssignmentToExistingVariables_Affected() =>
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
+                class C
+                {
+                    Generator? generator = null;
+                    void M() { string token; long expiryMs; (token, expiryMs) = generator.Generate(); }
+                }
+                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void DeconstructionBlastRadius_OutVar_NotAffected() =>
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public bool TryGenerate(out string token) { token = "x"; return true; } }
+                class C
+                {
+                    Generator? generator = null;
+                    void M() { generator.TryGenerate(out var token); }
+                }
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull);
+
+        [Fact]
+        public void DeconstructionBlastRadius_ThreeElementTuple_Affected() =>
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public (string A, string B, string C) Generate() => ("a", "b", "c"); }
+                class C
+                {
+                    Generator? generator = null;
+                    void M() { var (a, b, c) = generator.Generate(); }
+                }
+                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void DeconstructionBlastRadius_NarrowedThenDeconstructed_AffectedEvenWhenProvablyNonNull() =>
+            // Matches the "NarrowedThenDeconstructed" accepted-FN case from sonar-dotnet-enterprise PR #2594:
+            // even though the real compiler can prove "generator" is non-null here (narrowed by the
+            // preceding null check), the deconstruction-wide suppression in NullableWalker still
+            // blanks out the recorded result, regardless of how confidently non-null the receiver is.
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
+                class C
+                {
+                    void M(Generator? generator)
+                    {
+                        if (generator != null)
+                        {
+                            var (token, expiryMs) = generator.Generate();
+                        }
+                    }
+                }
+                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void DeconstructionBlastRadius_LaterStatementDoesNotMatter_Affected() =>
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public (string Token, long ExpiryMs) Generate() => ("token", 0); }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        var (token, expiryMs) = generator.Generate();
+                        System.Console.WriteLine(token);
+                    }
+                }
+                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void DeconstructionBlastRadius_RecursivePattern_NotAffected() =>
+            // Positional pattern matching (`is (var a, var b)`) lowers through a different NullableWalker
+            // path (VisitDeconstructMethodArguments-adjacent pattern handling), not VisitTupleDeconstructionArguments,
+            // and is not affected.
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class Generator { public void Deconstruct(out string token, out long expiryMs) { token = "x"; expiryMs = 0; } }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        if (generator is (var token, var expiryMs)) { }
+                    }
+                }
+                """, CodeAnalysis.NullableFlowState.MaybeNull, CodeAnalysis.NullableFlowState.MaybeNull, identifierText: "generator");
+
+        [Fact]
+        public void DeconstructionBlastRadius_TupleLiteralRhsWithoutDeconstructMethod_Affected() =>
+            // RHS is a plain tuple literal (ValueTuple), not a call needing a Deconstruct() method -
+            // isolates "deconstruction assignment target" from "Deconstruct() method resolution": still affected.
+            AssertDeconstructionBlastRadius("""
+                #nullable enable
+                class C
+                {
+                    string? generator = null;
+                    void M()
+                    {
+                        var (token, other) = (generator, 1);
+                    }
+                }
+                """, CodeAnalysis.NullableFlowState.None, CodeAnalysis.NullableFlowState.None);
+
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
         [InlineData("while (y.Length != 2)")]
