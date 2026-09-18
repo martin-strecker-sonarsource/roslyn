@@ -65973,6 +65973,111 @@ class C
             Assert.Equal("System.Object", objectSymbol2.ToTestDisplayString());
         }
 
+        [Fact]
+        public void NonSpeculative_AttributeArgument_GetTypeInfo_FlowState()
+        {
+            // Control: the real (non-speculative) model correctly resolves a constant reference
+            // used as an attribute argument to NotNull.
+            var source = """
+                #nullable enable
+                using System;
+                class MyAttribute : Attribute
+                {
+                    public MyAttribute(string s) { }
+                }
+                class C
+                {
+                    private const string? Value = "x";
+                    [MyAttribute(Value!)]
+                    public void Method() { }
+                }
+                """;
+            var comp = CreateCompilation(source);
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+
+            var operand = tree.GetRoot().DescendantNodes().OfType<PostfixUnaryExpressionSyntax>()
+                .Single(p => p.IsKind(SyntaxKind.SuppressNullableWarningExpression)).Operand;
+
+            Assert.Equal(CodeAnalysis.NullableFlowState.NotNull, model.GetTypeInfo(operand).Nullability.FlowState);
+        }
+
+        // Faithful replica of SonarAnalyzer's ChangeSyntaxElement() (the mechanism behind
+        // https://github.com/SonarSource/sonar-dotnet-enterprise/pull/2594): find the null-forgiving
+        // suppression, ReplaceNode() it out with its own Operand within the enclosing AttributeSyntax
+        // (not a freestanding reparse of source text - that behaves differently, see the non-repro
+        // variant below), then speculate via TryGetSpeculativeSemanticModel using the replaced node.
+        private static void AssertAttributeArgumentSpeculativeReplaceNodeFlowState(string source, CSharpCompilationOptions options, CodeAnalysis.NullableFlowState expectedSpeculative)
+        {
+            var comp = CreateCompilation(source, options: options);
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+
+            var attribute = tree.GetRoot().DescendantNodes().OfType<AttributeSyntax>().Single();
+            var suppression = attribute.DescendantNodes().OfType<PostfixUnaryExpressionSyntax>()
+                .Single(p => p.IsKind(SyntaxKind.SuppressNullableWarningExpression));
+            var operand = suppression.Operand;
+
+            var annotation = new Microsoft.CodeAnalysis.SyntaxAnnotation();
+            var annotated = operand.WithAdditionalAnnotations(annotation);
+            var replaced = (AttributeSyntax)attribute.ReplaceNode(suppression, annotated);
+
+            Assert.True(model.TryGetSpeculativeSemanticModel(suppression.SpanStart, replaced, out var speculativeModel));
+
+            var valueIdentifier = replaced.GetAnnotatedNodes(annotation).Single();
+            var flowState = speculativeModel!.GetTypeInfo(valueIdentifier).Nullability.FlowState;
+            Assert.Equal(expectedSpeculative, flowState);
+        }
+
+        [Fact]
+        public void AttributeArgument_ReplaceNodeSpeculation_LosesFlowState_FilePragma() =>
+            // BUG: same node the control test above resolves to NotNull on the real model - but
+            // speculating just the isolated AttributeSyntax (as ChangeSyntaxElement does for this
+            // container kind) gives None. Root cause: the ReplaceNode()-produced `replaced` node is
+            // rooted in a freshly synthesized tree scoped to just the replaced snippet's own text,
+            // with positions restarting at 0 (verified: replaced.Span starts at 0, replaced.SyntaxTree
+            // is neither null nor the original tree). CSharpCompilation.IsNullableAnalysisEnabledIn
+            // looks up directive-trivia state in that tiny synthetic tree, which cannot see the real
+            // file's #nullable enable pragma living outside its narrow text window, and falls through
+            // to the compilation-level (Options.NullableContextOptions & Warnings) != 0 fallback -
+            // which is false here since nullable is only enabled per-file, not compilation-wide.
+            AssertAttributeArgumentSpeculativeReplaceNodeFlowState("""
+                #nullable enable
+                using System;
+                class MyAttribute : Attribute
+                {
+                    public MyAttribute(string s) { }
+                }
+                class C
+                {
+                    private const string? Value = "x";
+                    [MyAttribute(Value!)]
+                    public void Method() { }
+                }
+                """, options: null, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void AttributeArgument_ReplaceNodeSpeculation_PreservesFlowState_ProjectWideEnable_Rescued() =>
+            // Unlike the sibling parameter-default bug (never rescued), this one IS rescued by
+            // project-wide <Nullable>enable</Nullable> with no #nullable pragma in source: the
+            // compilation-level NullableContextOptions.Warnings bit (set by NullableContextOptions.Enable)
+            // satisfies the fallback in IsNullableAnalysisEnabledIn even though the synthetic tree still
+            // can't see any pragma - so this bug is invisible for the common project-wide-nullable setup
+            // and only bites source files opting in via a bare #nullable enable pragma directive.
+            AssertAttributeArgumentSpeculativeReplaceNodeFlowState("""
+                using System;
+                class MyAttribute : Attribute
+                {
+                    public MyAttribute(string s) { }
+                }
+                class C
+                {
+                    private const string? Value = "x";
+                    [MyAttribute(Value!)]
+                    public void Method() { }
+                }
+                """, options: WithNullableEnable(), CodeAnalysis.NullableFlowState.MaybeNull);
+
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
         [InlineData("while (y.Length != 2)")]
