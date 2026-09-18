@@ -164,8 +164,130 @@ namespace Microsoft.CodeAnalysis.CSharp
 
             public override BoundNode? VisitDeconstructionAssignmentOperator(BoundDeconstructionAssignmentOperator node)
             {
+                if (node.HasErrors)
+                {
+                    // Mirror NullableWalker.VisitDeconstructionAssignmentOperator's HasErrors
+                    // short-circuit exactly: the left targets are still visited (GetDeconstructionAssignmentVariables
+                    // runs unconditionally), but the right side is visited as a plain rvalue with no
+                    // deconstruction-shaped unwrapping at all.
+                    VisitDeconstructionAssignmentTargets(node.Left);
+                    Visit(node.Right.Operand);
+                    return null;
+                }
                 // https://github.com/dotnet/roslyn/issues/35010: handle
+                VisitDeconstruction(node.Left, node.Right.Conversion, node.Right.Operand);
                 return null;
+            }
+
+            // Mirrors NullableWalker.VisitDeconstructionArguments + VisitDeconstructMethodArguments +
+            // VisitTupleDeconstructionArguments + GetDeconstructionRightParts together: dispatches on
+            // whether `conversion` needs a user-defined Deconstruct() method call or built-in tuple-shape
+            // decomposition, and recurses through nested targets (e.g. the "(c.P, _)" in
+            // "((c.P, _), _) = ((null, 1), 2);", or a nested Deconstruct()-method out-argument) using
+            // each position's own underlying conversion, exactly mirroring the real walker's own
+            // recursive structure - instead of treating every right-hand element as an independent
+            // plain rvalue, which would miss that its own arguments/conversions/out-arguments are
+            // never themselves visited/recorded the same way as at the top level.
+            private void VisitDeconstruction(BoundTupleExpression left, Conversion conversion, BoundExpression right)
+            {
+                if (!conversion.DeconstructionInfo.IsDefault)
+                {
+                    // NullableWalker.VisitDeconstructMethodArguments: the receiver is visited/recorded
+                    // once as a whole; nested targets recurse against the corresponding Deconstruct()
+                    // out-argument (typically a BoundDeconstructValuePlaceholder) as their own right-hand
+                    // side. Plain (non-nested) targets are visited directly here -
+                    // VisitDeconstructMethodArguments never touches their out-argument for those, only
+                    // variable.Expression (via VisitArgumentConversionAndInboundAssignmentsAndPreConditions).
+                    Visit(right);
+                    var invocation = (BoundCall)conversion.DeconstructionInfo.Invocation;
+                    int offset = invocation.InvokedAsExtensionMethod ? 1 : 0;
+                    for (int i = 0; i < left.Arguments.Length; i++)
+                    {
+                        if (left.Arguments[i] is BoundTupleExpression nestedLeft)
+                        {
+                            var (placeholder, placeholderConversion) = conversion.DeconstructConversionInfo[i];
+                            var underlyingConversion = BoundNode.GetConversion(placeholderConversion, placeholder);
+                            VisitDeconstruction(nestedLeft, underlyingConversion, invocation.Arguments[i + offset]);
+                        }
+                        else
+                        {
+                            Visit(left.Arguments[i]);
+                        }
+                    }
+                    return;
+                }
+
+                switch (right.Kind)
+                {
+                    case BoundKind.TupleLiteral:
+                    case BoundKind.ConvertedTupleLiteral:
+                        {
+                            var rightParts = ((BoundTupleExpression)right).Arguments;
+                            for (int i = 0; i < left.Arguments.Length; i++)
+                            {
+                                var (placeholder, placeholderConversion) = conversion.DeconstructConversionInfo[i];
+                                var underlyingConversion = BoundNode.GetConversion(placeholderConversion, placeholder);
+                                visitTarget(left.Arguments[i], underlyingConversion, rightParts[i]);
+                            }
+                            return;
+                        }
+                    case BoundKind.Conversion:
+                        {
+                            var conv = (BoundConversion)right;
+                            switch (conv.ConversionKind)
+                            {
+                                case ConversionKind.Identity:
+                                case ConversionKind.ImplicitTupleLiteral:
+                                    VisitDeconstruction(left, conversion, conv.Operand);
+                                    return;
+                            }
+                            break;
+                        }
+                }
+
+                // `right` doesn't structurally decompose (e.g. it's a method call returning a tuple) -
+                // the real walker visits/records it exactly once as a whole (NullableWalker.
+                // GetDeconstructionRightParts's single VisitRvalueWithState(expr) call, see
+                // NullableWalker.cs) and reads each element from N synthetic BoundFieldAccess wrappers
+                // that are never themselves visited/recorded (excluded in SetAnalyzedNullability).
+                // A nested target under this case would recurse against one of those never-recorded
+                // wrappers, which has nothing further for the DebugVerifier to descend into - just
+                // visit `right` once and treat every left target (nested or not) the same way the
+                // outer-level VisitDeconstructionAssignmentTargets already does for non-nested cases.
+                Visit(right);
+                VisitDeconstructionAssignmentTargets(left);
+
+                void visitTarget(BoundExpression leftArg, Conversion elementConversion, BoundExpression rightPart)
+                {
+                    if (leftArg is BoundTupleExpression nestedLeft)
+                    {
+                        VisitDeconstruction(nestedLeft, elementConversion, rightPart);
+                    }
+                    else
+                    {
+                        // Unlike the nested case, a plain target's own right-hand part (e.g. "generator"
+                        // in "var (token, other) = (generator, 1);") IS visited/recorded by the real
+                        // walker (VisitTupleDeconstructionArguments's per-element VisitRvalueWithState/
+                        // VisitOptionalImplicitConversion call on rightPart), so it must be verified too.
+                        Visit(rightPart);
+                        Visit(leftArg);
+                    }
+                }
+            }
+
+            private void VisitDeconstructionAssignmentTargets(BoundTupleExpression left)
+            {
+                foreach (var argument in left.Arguments)
+                {
+                    if (argument is BoundTupleExpression nestedTuple)
+                    {
+                        VisitDeconstructionAssignmentTargets(nestedTuple);
+                    }
+                    else
+                    {
+                        Visit(argument);
+                    }
+                }
             }
 
             public override BoundNode? VisitBadExpression(BoundBadExpression node)
@@ -234,8 +356,16 @@ namespace Microsoft.CodeAnalysis.CSharp
                     VisitForEachEnumeratorInfo(node.EnumeratorInfoOpt);
                 }
                 Visit(node.Expression);
-                // https://github.com/dotnet/roslyn/issues/35010: handle the deconstruction
-                //this.Visit(node.DeconstructionOpt);
+                if (node.DeconstructionOpt is { DeconstructionAssignment: { } assignment })
+                {
+                    // Mirror NullableWalker.VisitForEachIterationVariables: the foreach deconstruction
+                    // assignment is analyzed/recorded (via VisitDeconstructionAssignmentOperator, called
+                    // directly rather than reached generically since DeconstructionOpt isn't a normal
+                    // visitable child slot for control-flow passes) exactly like a standalone deconstruction
+                    // assignment statement - Visit() here reaches the same VisitDeconstructionAssignmentOperator
+                    // override used for that case, verifying the assignment node itself plus its targets/parts.
+                    Visit(assignment);
+                }
                 Visit(node.Body);
                 return null;
             }

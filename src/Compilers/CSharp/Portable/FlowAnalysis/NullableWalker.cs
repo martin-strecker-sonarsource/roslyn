@@ -246,9 +246,6 @@ namespace Microsoft.CodeAnalysis.CSharp
         /// </summary>
         private readonly SnapshotManager.Builder? _snapshotBuilderOpt;
 
-        // https://github.com/dotnet/roslyn/issues/35043: remove this when all expression are supported
-        private bool _disableNullabilityAnalysis;
-
         /// <summary>
         /// State of method group receivers, used later when analyzing the conversion to a delegate.
         /// (Could be replaced by _analyzedNullabilityMapOpt if that map is always available.)
@@ -390,7 +387,21 @@ namespace Microsoft.CodeAnalysis.CSharp
             if (expr == null
                 // BoundExpressionWithNullability is not produced by the binder but is used within nullability analysis to pass information to internal components.
                 || expr.Kind == BoundKind.ExpressionWithNullability
-                || _disableNullabilityAnalysis)
+                // Deconstruction synthesizes a per-element tuple field access (.Item1/.Item2, see
+                // GetDeconstructionRightParts) that borrows its receiver's own syntax verbatim instead of
+                // having distinct syntax of its own - unlike a real source-written ".ItemN" access, which
+                // always has its own MemberAccessExpressionSyntax distinct from its receiver's syntax. That
+                // synthetic wrapper has no home in the bound tree returned to callers, so recording it would
+                // be meaningless to GetTypeInfo callers and would make the DebugVerifier's independent tree
+                // walk unable to corroborate it. Excluding by shared syntax alone is too broad though: an
+                // ordinary implicit-`this` field access (e.g. `Item1 = item1;` inside a user-defined
+                // ValueTuple<T1, T2>'s own constructor, see Tuple_OtherMembers_01) also borrows its (implicit
+                // this) receiver's syntax, so also require the receiver not be an implicit this/base
+                // reference to keep that real, GetTypeInfo-relevant access out of this exclusion.
+                || (expr is BoundFieldAccess { ReceiverOpt: { } receiver } fieldAccess
+                    && fieldAccess.FieldSymbol.IsTupleElement()
+                    && receiver is not (BoundThisReference or BoundBaseReference)
+                    && ReferenceEquals(expr.Syntax, receiver.Syntax)))
             {
                 return;
             }
@@ -2261,6 +2272,14 @@ namespace Microsoft.CodeAnalysis.CSharp
                     case BoundKind.TupleLiteral:
                     case BoundKind.ConvertedTupleLiteral:
                         return getPlaceholderSlot(node);
+                    case BoundKind.ExpressionWithNullability:
+                        // This placeholder stands in for its wrapped Expression (see the type's own
+                        // doc comment and CreatePlaceholderIfNecessary) so that a previously-visited
+                        // value can be safely revisited without side effects; it should behave like
+                        // that wrapped expression for slot purposes too, e.g. so a member access whose
+                        // receiver got wrapped this way can still find the receiver's own placeholder
+                        // slot (see GetDeconstructionRightParts) instead of losing track of it.
+                        return MakeSlot(((BoundExpressionWithNullability)node).Expression);
                     case BoundKind.ConditionalAccess:
                         return getPlaceholderSlot(node);
                     case BoundKind.ConditionalReceiver:
@@ -11483,8 +11502,6 @@ namespace Microsoft.CodeAnalysis.CSharp
 
         private BoundNode? VisitDeconstructionAssignmentOperator(BoundDeconstructionAssignmentOperator node, TypeWithState? rightResultOpt)
         {
-            var previousDisableNullabilityAnalysis = _disableNullabilityAnalysis;
-            _disableNullabilityAnalysis = true;
             var left = node.Left;
             var right = node.Right;
             var variables = GetDeconstructionAssignmentVariables(left);
@@ -11507,7 +11524,6 @@ namespace Microsoft.CodeAnalysis.CSharp
             // has a test for this case that should start failing when this is fixed.
             SetNotNullResult(node);
 
-            _disableNullabilityAnalysis = previousDisableNullabilityAnalysis;
             return null;
         }
 
@@ -11778,10 +11794,18 @@ namespace Microsoft.CodeAnalysis.CSharp
                     }
                     break;
             }
-            if (rightResultOpt is { } rightResult)
-            {
-                expr = CreatePlaceholderIfNecessary(expr, rightResult.ToTypeWithAnnotations(compilation));
-            }
+            // The N synthetic per-element BoundFieldAccess nodes constructed below all share this
+            // same `expr` instance as their receiver. If `expr` itself were embedded directly (as
+            // it used to be when rightResultOpt was unavailable), each of the N field accesses'
+            // VisitRvalueWithState call below would fully re-visit `expr` - re-running receiver
+            // null-checks/narrowing side effects N times and leaving only the *last* visit's
+            // (already-narrowed, so misleadingly non-null) result recorded for GetTypeInfo callers.
+            // Visiting `expr` exactly once here and handing out a placeholder instead makes the
+            // repeated per-element visits inert re-reads of the cached result (see
+            // VisitExpressionWithNullability), matching VisitDeconstructMethodArguments's single
+            // VisitRvalue(right) call for the analogous Deconstruct-method-invocation case.
+            var rightResult = rightResultOpt ?? VisitRvalueWithState(expr);
+            expr = CreatePlaceholderIfNecessary(expr, rightResult.ToTypeWithAnnotations(compilation));
 
             if (expr.Type is NamedTypeSymbol { IsTupleType: true } tupleType)
             {
