@@ -165,7 +165,29 @@ namespace Microsoft.CodeAnalysis.CSharp
             public override BoundNode? VisitDeconstructionAssignmentOperator(BoundDeconstructionAssignmentOperator node)
             {
                 // https://github.com/dotnet/roslyn/issues/35010: handle
+                // The outer tuple literal on the left is never itself visited/recorded by the
+                // NullableWalker during deconstruction (only its individual target expressions are),
+                // so descend into its arguments directly instead of visiting node.Left as a whole.
+                VisitDeconstructionAssignmentTargets(node.Left);
+                // Mirror NullableWalker.VisitDeconstructionAssignmentOperator: only right.Operand is
+                // ever visited/recorded; the wrapping Deconstruction-kind BoundConversion itself is not.
+                Visit(node.Right.Operand);
                 return null;
+            }
+
+            private void VisitDeconstructionAssignmentTargets(BoundTupleExpression left)
+            {
+                foreach (var argument in left.Arguments)
+                {
+                    if (argument is BoundTupleExpression nestedTuple)
+                    {
+                        VisitDeconstructionAssignmentTargets(nestedTuple);
+                    }
+                    else
+                    {
+                        Visit(argument);
+                    }
+                }
             }
 
             public override BoundNode? VisitBadExpression(BoundBadExpression node)

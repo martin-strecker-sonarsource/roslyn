@@ -390,7 +390,18 @@ namespace Microsoft.CodeAnalysis.CSharp
             if (expr == null
                 // BoundExpressionWithNullability is not produced by the binder but is used within nullability analysis to pass information to internal components.
                 || expr.Kind == BoundKind.ExpressionWithNullability
-                || _disableNullabilityAnalysis)
+                || _disableNullabilityAnalysis
+                // Deconstruction synthesizes a per-element tuple field access (.Item1/.Item2, see
+                // GetDeconstructionRightParts) that borrows its receiver's own syntax verbatim instead of
+                // having distinct syntax of its own - unlike a real source-written ".ItemN" access, which
+                // always has its own MemberAccessExpressionSyntax distinct from its receiver's syntax. That
+                // synthetic wrapper has no home in the bound tree returned to callers, so recording it would
+                // be meaningless to GetTypeInfo callers and would make the DebugVerifier's independent tree
+                // walk unable to corroborate it. (Ordinary implicit-`this` field/property access also borrows
+                // its receiver's syntax, which is why this is additionally scoped to tuple element fields.)
+                || (expr is BoundFieldAccess { ReceiverOpt: { } receiver } fieldAccess
+                    && fieldAccess.FieldSymbol.IsTupleElement()
+                    && ReferenceEquals(expr.Syntax, receiver.Syntax)))
             {
                 return;
             }
@@ -11483,8 +11494,6 @@ namespace Microsoft.CodeAnalysis.CSharp
 
         private BoundNode? VisitDeconstructionAssignmentOperator(BoundDeconstructionAssignmentOperator node, TypeWithState? rightResultOpt)
         {
-            var previousDisableNullabilityAnalysis = _disableNullabilityAnalysis;
-            _disableNullabilityAnalysis = true;
             var left = node.Left;
             var right = node.Right;
             var variables = GetDeconstructionAssignmentVariables(left);
@@ -11507,7 +11516,6 @@ namespace Microsoft.CodeAnalysis.CSharp
             // has a test for this case that should start failing when this is fixed.
             SetNotNullResult(node);
 
-            _disableNullabilityAnalysis = previousDisableNullabilityAnalysis;
             return null;
         }
 

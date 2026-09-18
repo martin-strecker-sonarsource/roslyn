@@ -66060,6 +66060,205 @@ class C
             Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
         }
 
+        [Fact]
+        public void NonSpeculative_DeconstructionAssignment_GetTypeInfo_FlowState()
+        {
+            // Control: does the bug even require speculation? Query GetTypeInfo directly on the
+            // ORIGINAL (non-speculative) semantic model for the same receiver.
+            var source = """
+                #nullable enable
+                class Generator
+                {
+                    public (string Token, long ExpiryMs) Generate() => ("token", 0);
+                }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        var (token, expiryMs) = generator.Generate();
+                    }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics(
+                // (11,33): warning CS8602: Dereference of a possibly null reference.
+                //         var (token, expiryMs) = generator.Generate();
+                Diagnostic(ErrorCode.WRN_NullReferenceReceiver, "generator").WithLocation(11, 33));
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var generatorIdentifier = tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "generator");
+
+            var flowState = model.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
+        }
+
+        [Fact]
+        public void NonSpeculative_PlainInvocation_GetTypeInfo_FlowState()
+        {
+            // Control for NonSpeculative_DeconstructionAssignment_GetTypeInfo_FlowState: same
+            // receiver, no deconstruction. Confirms plain GetTypeInfo works outside deconstruction.
+            var source = """
+                #nullable enable
+                class Generator
+                {
+                    public (string Token, long ExpiryMs) Generate() => ("token", 0);
+                }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        generator.Generate();
+                    }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics(
+                // (11,9): warning CS8602: Dereference of a possibly null reference.
+                //         generator.Generate();
+                Diagnostic(ErrorCode.WRN_NullReferenceReceiver, "generator").WithLocation(11, 9));
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var generatorIdentifier = tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "generator");
+
+            var flowState = model.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
+        }
+
+        [Fact]
+        public void NonSpeculative_ParameterDefault_GetTypeInfo_FlowState()
+        {
+            // Real (non-speculative) GetTypeInfo on a parameter default's constant reference.
+            var source = """
+                #nullable enable
+                class C
+                {
+                    private const string Value = "x";
+                    public void Method(string s = Value) { }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics();
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var valueIdentifier = tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "Value");
+
+            var flowState = model.GetTypeInfo(valueIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.NotNull, flowState);
+        }
+
+        [Fact]
+        public void Speculative_ParameterDefault_GetTypeInfo_FlowState()
+        {
+            // BUG: same query, but through TryGetSpeculativeSemanticModel(EqualsValueClauseSyntax) instead
+            // of the original tree. SpeculativeSemanticModelWithMemberModel's EqualsValueClauseSyntax
+            // constructor passes the EqualsValueClauseSyntax itself as InitializerSemanticModel's Root,
+            // but InitializerSemanticModel.IsNullableAnalysisEnabledCore() does `Root as ParameterSyntax`
+            // for SymbolKind.Parameter - which is null for a speculative model, so nullable analysis is
+            // considered disabled and EnsureNullabilityAnalysis short-circuits without ever binding.
+            var source = """
+                #nullable enable
+                class C
+                {
+                    private const string Value = "x";
+                    public void Method(string s = Value) { }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics();
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var originalEquals = tree.GetRoot().DescendantNodes().OfType<ParameterSyntax>().Single().Default!;
+
+            var speculatedEquals = (EqualsValueClauseSyntax)SyntaxFactory.ParseParameterList("(string s = Value)")
+                .Parameters.Single().Default!;
+            Assert.True(model.TryGetSpeculativeSemanticModel(originalEquals.SpanStart, speculatedEquals, out var speculativeModel));
+
+            var valueIdentifier = speculatedEquals.DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "Value");
+
+            var flowState = speculativeModel!.GetTypeInfo(valueIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.None, flowState);
+        }
+
+        [Fact]
+        public void NonSpeculative_AttributeArgument_GetTypeInfo_FlowState()
+        {
+            var source = """
+                #nullable enable
+                using System;
+                class MyAttribute : Attribute
+                {
+                    public MyAttribute(string s) { }
+                }
+                class C
+                {
+                    private const string Value = "x";
+                    [MyAttribute(Value)]
+                    public void Method() { }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics();
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var valueIdentifier = tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "Value");
+
+            var flowState = model.GetTypeInfo(valueIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.NotNull, flowState);
+        }
+
+        [Fact]
+        public void Speculative_AttributeArgument_GetTypeInfo_FlowState()
+        {
+            var source = """
+                #nullable enable
+                using System;
+                class MyAttribute : Attribute
+                {
+                    public MyAttribute(string s) { }
+                }
+                class C
+                {
+                    private const string Value = "x";
+                    [MyAttribute(Value)]
+                    public void Method() { }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics();
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var originalAttribute = tree.GetRoot().DescendantNodes().OfType<AttributeSyntax>().Single();
+
+            var speculatedAttribute = SyntaxFactory.ParseCompilationUnit("#nullable enable\n[MyAttribute(Value)]class D{}")
+                .DescendantNodes().OfType<AttributeSyntax>().Single();
+            Assert.True(model.TryGetSpeculativeSemanticModel(originalAttribute.SpanStart, speculatedAttribute, out var speculativeModel));
+
+            var valueIdentifier = speculatedAttribute.DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "Value");
+
+            var flowState = speculativeModel!.GetTypeInfo(valueIdentifier).Nullability.FlowState;
+            Assert.Equal(CodeAnalysis.NullableFlowState.None, flowState);
+        }
+
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
         [InlineData("while (y.Length != 2)")]
