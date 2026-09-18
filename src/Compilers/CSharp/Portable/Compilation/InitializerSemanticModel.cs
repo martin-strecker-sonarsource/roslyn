@@ -8,6 +8,7 @@ using System.Collections.Immutable;
 using System.Diagnostics;
 using Microsoft.CodeAnalysis.CSharp.Symbols;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 using Roslyn.Utilities;
 
 namespace Microsoft.CodeAnalysis.CSharp
@@ -280,8 +281,27 @@ namespace Microsoft.CodeAnalysis.CSharp
                     return MemberSymbol.ContainingType is SourceMemberContainerTypeSymbol type &&
                         type.IsNullableEnabledForConstructorsAndInitializers(useStatic: MemberSymbol.IsStatic);
                 case SymbolKind.Parameter:
-                    return SourceComplexParameterSymbolBase.GetDefaultValueSyntaxForIsNullableAnalysisEnabled(Root as ParameterSyntax) is { } value &&
-                        Compilation.IsNullableAnalysisEnabledIn(value);
+                    // Simpler alternative considered and rejected: `(Root as ParameterSyntax) ?? (Root as EqualsValueClauseSyntax)?.Value`.
+                    // It only rescues project-wide `Nullable=enable`; a file-scoped `#nullable enable` pragma stays invisible for Sonar's
+                    // actual (narrow-node) ReplaceNode pattern, since Root's SyntaxTree is then a synthetic tree without the real file's pragma.
+                    if (SourceComplexParameterSymbolBase.GetDefaultValueSyntaxForIsNullableAnalysisEnabled(Root as ParameterSyntax) is { } value)
+                    {
+                        return Compilation.IsNullableAnalysisEnabledIn(value);
+                    }
+
+                    // Root is not a ParameterSyntax when this is a speculative model built for just an
+                    // isolated EqualsValueClauseSyntax (see CreateSpeculative below) - there is no
+                    // enclosing ParameterSyntax to consult here by design. Fall back to the
+                    // nullable-context state at the *original* (pre-speculation) position instead of
+                    // treating analysis as unconditionally disabled for every parameter-default
+                    // speculation.
+                    if (ContainingPublicModelOrSelf.IsSpeculativeSemanticModel
+                        && ContainingPublicModelOrSelf.ParentModel?.SyntaxTree is CSharpSyntaxTree parentTree)
+                    {
+                        return Compilation.IsNullableAnalysisEnabledIn(parentTree, new TextSpan(ContainingPublicModelOrSelf.OriginalPositionForSpeculation, 0));
+                    }
+
+                    return false;
                 default:
                     throw ExceptionUtilities.UnexpectedValue(MemberSymbol.Kind);
             }

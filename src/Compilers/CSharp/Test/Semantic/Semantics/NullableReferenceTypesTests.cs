@@ -66025,13 +66025,15 @@ class C
         }
 
         [Fact]
-        public void ParameterDefault_ReplaceNodeSpeculation_LosesFlowState_FilePragma() =>
-            // BUG: same node the control test above resolves to NotNull on the real model - but
-            // speculating just the isolated EqualsValueClauseSyntax (as ChangeSyntaxElement does for
-            // this container kind) gives None. Root cause: InitializerSemanticModel.IsNullableAnalysisEnabledCore(),
-            // for SymbolKind.Parameter, does `Root as ParameterSyntax` - but Root for this speculative
-            // model IS the EqualsValueClauseSyntax itself, not a ParameterSyntax, so the cast fails and
-            // nullable analysis is considered entirely disabled for the speculative model.
+        public void ParameterDefault_ReplaceNodeSpeculation_PreservesFlowState_FilePragma() =>
+            // FIXED: speculating just the isolated EqualsValueClauseSyntax (as ChangeSyntaxElement
+            // does for this container kind) used to give None instead of the correct MaybeNull.
+            // Root cause: InitializerSemanticModel.IsNullableAnalysisEnabledCore(), for
+            // SymbolKind.Parameter, did `Root as ParameterSyntax` - but Root for this speculative
+            // model IS the EqualsValueClauseSyntax itself, not a ParameterSyntax, so the cast failed
+            // and nullable analysis was considered entirely disabled for the speculative model. Fixed
+            // by falling back to the nullable-context state at the original (pre-speculation)
+            // position via IsSpeculativeSemanticModel/OriginalPositionForSpeculation/ParentModel.
             AssertParameterDefaultSpeculativeReplaceNodeFlowState("""
                 #nullable enable
                 class C
@@ -66039,22 +66041,22 @@ class C
                     private const string? Value = "x";
                     public void Method(string s = Value!) { }
                 }
-                """, options: null, CodeAnalysis.NullableFlowState.None);
+                """, options: null, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
-        public void ParameterDefault_ReplaceNodeSpeculation_LosesFlowState_ProjectWideEnable_NotRescued() =>
-            // Unlike the attribute-argument sibling bug (which IS rescued by project-wide
-            // <Nullable>enable</Nullable> - see the compilation-level NullableContextOptions.Warnings
-            // fallback in CSharpCompilation.IsNullableAnalysisEnabledIn), this one is NOT rescued: the
-            // `Root as ParameterSyntax` cast fails unconditionally, before any compilation-level
-            // nullable-context fallback is even consulted. No #nullable pragma in source at all.
+        public void ParameterDefault_ReplaceNodeSpeculation_PreservesFlowState_ProjectWideEnable() =>
+            // Same fix as above, but via project-wide <Nullable>enable</Nullable> instead of a
+            // #nullable pragma - the original bug was NOT rescued by this configuration (unlike the
+            // sibling attribute-argument bug), so this variant exercises the fallback's
+            // Compilation.IsNullableAnalysisEnabledIn(tree, span) path specifically. No #nullable
+            // pragma in source at all.
             AssertParameterDefaultSpeculativeReplaceNodeFlowState("""
                 class C
                 {
                     private const string? Value = "x";
                     public void Method(string s = Value!) { }
                 }
-                """, options: WithNullableEnable(), CodeAnalysis.NullableFlowState.None);
+                """, options: WithNullableEnable(), CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
