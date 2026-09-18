@@ -65973,6 +65973,89 @@ class C
             Assert.Equal("System.Object", objectSymbol2.ToTestDisplayString());
         }
 
+        [Fact]
+        public void NonSpeculative_ParameterDefault_GetTypeInfo_FlowState()
+        {
+            // Control: the real (non-speculative) model correctly resolves a constant reference
+            // used as a parameter default to NotNull (the compiler knows "x" is never null, despite
+            // Value's declared type being string?).
+            var source = """
+                #nullable enable
+                class C
+                {
+                    private const string? Value = "x";
+                    public void Method(string s = Value!) { }
+                }
+                """;
+            var comp = CreateCompilation(source);
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+
+            var operand = tree.GetRoot().DescendantNodes().OfType<PostfixUnaryExpressionSyntax>()
+                .Single(p => p.IsKind(SyntaxKind.SuppressNullableWarningExpression)).Operand;
+
+            Assert.Equal(CodeAnalysis.NullableFlowState.NotNull, model.GetTypeInfo(operand).Nullability.FlowState);
+        }
+
+        // Faithful replica of SonarAnalyzer's ChangeSyntaxElement() (the mechanism behind
+        // https://github.com/SonarSource/sonar-dotnet-enterprise/pull/2594): find the null-forgiving
+        // suppression, ReplaceNode() it out with its own Operand within the enclosing
+        // EqualsValueClauseSyntax (not a freestanding reparse - that behaves differently, see the
+        // sibling attribute-argument reproducer), then speculate via TryGetSpeculativeSemanticModel.
+        private static void AssertParameterDefaultSpeculativeReplaceNodeFlowState(string source, CSharpCompilationOptions options, CodeAnalysis.NullableFlowState expectedSpeculative)
+        {
+            var comp = CreateCompilation(source, options: options);
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+
+            var equalsClause = tree.GetRoot().DescendantNodes().OfType<ParameterSyntax>().Single().Default!;
+            var suppression = equalsClause.DescendantNodes().OfType<PostfixUnaryExpressionSyntax>()
+                .Single(p => p.IsKind(SyntaxKind.SuppressNullableWarningExpression));
+            var operand = suppression.Operand;
+
+            var annotation = new Microsoft.CodeAnalysis.SyntaxAnnotation();
+            var annotated = operand.WithAdditionalAnnotations(annotation);
+            var replaced = (EqualsValueClauseSyntax)equalsClause.ReplaceNode(suppression, annotated);
+
+            Assert.True(model.TryGetSpeculativeSemanticModel(suppression.SpanStart, replaced, out var speculativeModel));
+
+            var valueIdentifier = replaced.GetAnnotatedNodes(annotation).Single();
+            var flowState = speculativeModel!.GetTypeInfo(valueIdentifier).Nullability.FlowState;
+            Assert.Equal(expectedSpeculative, flowState);
+        }
+
+        [Fact]
+        public void ParameterDefault_ReplaceNodeSpeculation_LosesFlowState_FilePragma() =>
+            // BUG: same node the control test above resolves to NotNull on the real model - but
+            // speculating just the isolated EqualsValueClauseSyntax (as ChangeSyntaxElement does for
+            // this container kind) gives None. Root cause: InitializerSemanticModel.IsNullableAnalysisEnabledCore(),
+            // for SymbolKind.Parameter, does `Root as ParameterSyntax` - but Root for this speculative
+            // model IS the EqualsValueClauseSyntax itself, not a ParameterSyntax, so the cast fails and
+            // nullable analysis is considered entirely disabled for the speculative model.
+            AssertParameterDefaultSpeculativeReplaceNodeFlowState("""
+                #nullable enable
+                class C
+                {
+                    private const string? Value = "x";
+                    public void Method(string s = Value!) { }
+                }
+                """, options: null, CodeAnalysis.NullableFlowState.None);
+
+        [Fact]
+        public void ParameterDefault_ReplaceNodeSpeculation_LosesFlowState_ProjectWideEnable_NotRescued() =>
+            // Unlike the attribute-argument sibling bug (which IS rescued by project-wide
+            // <Nullable>enable</Nullable> - see the compilation-level NullableContextOptions.Warnings
+            // fallback in CSharpCompilation.IsNullableAnalysisEnabledIn), this one is NOT rescued: the
+            // `Root as ParameterSyntax` cast fails unconditionally, before any compilation-level
+            // nullable-context fallback is even consulted. No #nullable pragma in source at all.
+            AssertParameterDefaultSpeculativeReplaceNodeFlowState("""
+                class C
+                {
+                    private const string? Value = "x";
+                    public void Method(string s = Value!) { }
+                }
+                """, options: WithNullableEnable(), CodeAnalysis.NullableFlowState.None);
+
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
         [InlineData("while (y.Length != 2)")]
