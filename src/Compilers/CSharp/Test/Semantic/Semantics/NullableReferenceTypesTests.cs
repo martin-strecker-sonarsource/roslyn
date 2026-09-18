@@ -65973,6 +65973,93 @@ class C
             Assert.Equal("System.Object", objectSymbol2.ToTestDisplayString());
         }
 
+        [Fact]
+        public void SpeculativeSemanticModel_DeconstructionAssignment_LosesNullableFlowState()
+        {
+            // The real compiler proves `generator` is MaybeNull here (see the CS8602 below).
+            var source = """
+                #nullable enable
+                class Generator
+                {
+                    public (string Token, long ExpiryMs) Generate() => ("token", 0);
+                }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        var (token, expiryMs) = generator.Generate();
+                    }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics(
+                // (11,33): warning CS8602: Dereference of a possibly null reference.
+                //         var (token, expiryMs) = generator.Generate();
+                Diagnostic(ErrorCode.WRN_NullReferenceReceiver, "generator").WithLocation(11, 33));
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var methodDecl = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.ValueText == "M");
+
+            // Re-speculate the (textually identical) whole method body, mirroring how a caller
+            // re-speculates the whole enclosing member to recover flow context lost by speculating
+            // just the isolated operand (see https://github.com/dotnet/roslyn/issues/35037).
+            var speculatedMethod = (MethodDeclarationSyntax)SyntaxFactory.ParseMemberDeclaration(methodDecl.ToFullString());
+            Assert.True(model.TryGetSpeculativeSemanticModelForMethodBody(methodDecl.Body!.SpanStart, speculatedMethod, out var speculativeModel));
+
+            var generatorIdentifier = speculatedMethod.DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "generator");
+            var flowState = speculativeModel!.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
+
+            // BUG: whole-method speculative rebind loses flow analysis across the deconstruction
+            // assignment and reports FlowState.None (inconclusive) instead of the real MaybeNull.
+            Assert.Equal(CodeAnalysis.NullableFlowState.None, flowState);
+        }
+
+        [Fact]
+        public void SpeculativeSemanticModel_PlainInvocation_PreservesNullableFlowState()
+        {
+            // Control for SpeculativeSemanticModel_DeconstructionAssignment_LosesNullableFlowState:
+            // same shape, but the receiver feeds a plain statement instead of a deconstruction
+            // assignment. Speculation correctly reports MaybeNull here.
+            var source = """
+                #nullable enable
+                class Generator
+                {
+                    public (string Token, long ExpiryMs) Generate() => ("token", 0);
+                }
+                class C
+                {
+                    Generator? generator = null;
+                    void M()
+                    {
+                        generator.Generate();
+                    }
+                }
+                """;
+
+            var comp = CreateCompilation(source);
+            comp.VerifyDiagnostics(
+                // (11,9): warning CS8602: Dereference of a possibly null reference.
+                //         generator.Generate();
+                Diagnostic(ErrorCode.WRN_NullReferenceReceiver, "generator").WithLocation(11, 9));
+
+            var tree = comp.SyntaxTrees.Single();
+            var model = comp.GetSemanticModel(tree);
+            var methodDecl = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.ValueText == "M");
+
+            var speculatedMethod = (MethodDeclarationSyntax)SyntaxFactory.ParseMemberDeclaration(methodDecl.ToFullString());
+            Assert.True(model.TryGetSpeculativeSemanticModelForMethodBody(methodDecl.Body!.SpanStart, speculatedMethod, out var speculativeModel));
+
+            var generatorIdentifier = speculatedMethod.DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Single(id => id.Identifier.ValueText == "generator");
+            var flowState = speculativeModel!.GetTypeInfo(generatorIdentifier).Nullability.FlowState;
+
+            Assert.Equal(CodeAnalysis.NullableFlowState.MaybeNull, flowState);
+        }
+
         [Theory, WorkItem("https://github.com/dotnet/roslyn/issues/70856")]
         [InlineData("foreach (var c in y)")]
         [InlineData("while (y.Length != 2)")]
