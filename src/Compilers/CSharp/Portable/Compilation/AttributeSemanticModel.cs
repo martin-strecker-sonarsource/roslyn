@@ -6,6 +6,7 @@ using System.Collections.Immutable;
 using System.Diagnostics;
 using Microsoft.CodeAnalysis.CSharp.Symbols;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 
 namespace Microsoft.CodeAnalysis.CSharp
 {
@@ -117,6 +118,18 @@ namespace Microsoft.CodeAnalysis.CSharp
 
         protected override bool IsNullableAnalysisEnabledCore()
         {
+            // For a speculative model built for just an isolated AttributeSyntax (see
+            // SpeculativeSemanticModelWithMemberModel's AttributeSyntax constructor), Root is a
+            // ReplaceNode()-produced node rooted in a freshly synthesized tree scoped to just that
+            // node's own text, with positions restarting at 0 - it cannot see any #nullable pragma
+            // living in the real file outside that narrow window. Use the nullable-context state at
+            // the *original* (pre-speculation) position instead in that case.
+            if (ContainingPublicModelOrSelf.IsSpeculativeSemanticModel
+                && ContainingPublicModelOrSelf.ParentModel?.SyntaxTree is CSharpSyntaxTree parentTree)
+            {
+                return Compilation.IsNullableAnalysisEnabledIn(parentTree, new TextSpan(ContainingPublicModelOrSelf.OriginalPositionForSpeculation, 0));
+            }
+
             return IsNullableAnalysisEnabledIn(Compilation, (AttributeSyntax)Root);
         }
 
