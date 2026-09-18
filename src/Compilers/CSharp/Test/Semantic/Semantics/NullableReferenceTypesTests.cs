@@ -66030,17 +66030,16 @@ class C
         }
 
         [Fact]
-        public void AttributeArgument_ReplaceNodeSpeculation_LosesFlowState_FilePragma() =>
-            // BUG: same node the control test above resolves to NotNull on the real model - but
-            // speculating just the isolated AttributeSyntax (as ChangeSyntaxElement does for this
-            // container kind) gives None. Root cause: the ReplaceNode()-produced `replaced` node is
-            // rooted in a freshly synthesized tree scoped to just the replaced snippet's own text,
-            // with positions restarting at 0 (verified: replaced.Span starts at 0, replaced.SyntaxTree
-            // is neither null nor the original tree). CSharpCompilation.IsNullableAnalysisEnabledIn
-            // looks up directive-trivia state in that tiny synthetic tree, which cannot see the real
-            // file's #nullable enable pragma living outside its narrow text window, and falls through
-            // to the compilation-level (Options.NullableContextOptions & Warnings) != 0 fallback -
-            // which is false here since nullable is only enabled per-file, not compilation-wide.
+        public void AttributeArgument_ReplaceNodeSpeculation_PreservesFlowState_FilePragma() =>
+            // FIXED: speculating just the isolated AttributeSyntax (as ChangeSyntaxElement does for
+            // this container kind) used to give None instead of the correct MaybeNull. Root cause: the
+            // ReplaceNode()-produced `replaced` node is rooted in a freshly synthesized tree scoped to
+            // just the replaced snippet's own text, with positions restarting at 0 (verified:
+            // replaced.Span starts at 0, replaced.SyntaxTree is neither null nor the original tree),
+            // so CSharpCompilation.IsNullableAnalysisEnabledIn's directive-trivia lookup in that tiny
+            // synthetic tree could never see the real file's #nullable enable pragma living outside its
+            // narrow text window. Fixed the same way as the sibling parameter-default bug: fall back to
+            // the nullable-context state at the original (pre-speculation) position when speculative.
             AssertAttributeArgumentSpeculativeReplaceNodeFlowState("""
                 #nullable enable
                 using System;
@@ -66054,16 +66053,15 @@ class C
                     [MyAttribute(Value!)]
                     public void Method() { }
                 }
-                """, options: null, CodeAnalysis.NullableFlowState.None);
+                """, options: null, CodeAnalysis.NullableFlowState.MaybeNull);
 
         [Fact]
-        public void AttributeArgument_ReplaceNodeSpeculation_PreservesFlowState_ProjectWideEnable_Rescued() =>
-            // Unlike the sibling parameter-default bug (never rescued), this one IS rescued by
-            // project-wide <Nullable>enable</Nullable> with no #nullable pragma in source: the
-            // compilation-level NullableContextOptions.Warnings bit (set by NullableContextOptions.Enable)
-            // satisfies the fallback in IsNullableAnalysisEnabledIn even though the synthetic tree still
-            // can't see any pragma - so this bug is invisible for the common project-wide-nullable setup
-            // and only bites source files opting in via a bare #nullable enable pragma directive.
+        public void AttributeArgument_ReplaceNodeSpeculation_PreservesFlowState_ProjectWideEnable() =>
+            // Before the fix, this configuration already happened to "rescue" the bug by accident (the
+            // compilation-level NullableContextOptions.Warnings fallback in IsNullableAnalysisEnabledIn
+            // masked the synthetic-tree lookup failure) - unlike the sibling parameter-default bug,
+            // which was never rescued by any configuration. Kept as a regression guard for that
+            // fallback path now that the primary fix makes it redundant for this shape.
             AssertAttributeArgumentSpeculativeReplaceNodeFlowState("""
                 using System;
                 class MyAttribute : Attribute
